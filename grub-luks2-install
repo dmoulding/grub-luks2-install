@@ -1,0 +1,340 @@
+#!/bin/bash
+
+function add_mod()
+{
+    local mod=${1}
+
+    if ! mod_added "${mod}" "${mods[@]}"; then
+        mods+=("${mod}")
+    fi
+}
+
+function mod_added()
+{
+    local mod=${1}
+    local other_mod
+
+    for other_mod in "${mods[@]}"; do
+        if [[ "${mod}" == "${other_mod}" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+function on_exit()
+{
+    if [[ -n "${config}" ]]; then
+        rm -f "${config}"
+    fi
+    if [[ -n "${log}" ]]; then
+        rm -f "${log}"
+    fi
+    for ((i = ${#mounted[@]} - 1; i >= 0; --i)); do
+        umount "${mounted[i]}"
+    done
+}
+
+trap on_exit EXIT
+
+if [[ "${EUID}" != 0 ]]; then
+    echo "Only root can run this script. (Did you forget to use \"sudo\"?)" >&2
+    exit 1
+fi
+
+if [[ "$(uname -m)" != x86_64 ]]; then
+    echo "This script is designed to install GRUB on x86_64 systems only." >&2
+    exit 1
+fi
+
+if [[ ! -d /sys/firmware/efi ]]; then
+    echo "This script is designed to install GRUB on UEFI systems only." >&2
+    exit 1
+fi
+
+if mountpoint /boot &> /dev/null; then
+    bootmnt=/boot
+else
+    if mount /boot &> /dev/null; then
+        bootmnt=/boot
+        mounted+=(/boot)
+    else
+        echo "Nothing mounts at /boot. If this is correct, and /boot is" >&2
+        echo "supposed to be on the same device as the root file system," >&2
+        echo "then enter 'y' to continue." >&2
+        read -p "Continue? : "
+        if [[ "${REPLY}" != y ]]; then
+            exit 1
+        fi
+        bootmnt=/
+    fi
+fi
+
+if ! mountpoint /boot/efi &> /dev/null; then
+    if mount /boot/efi; then
+        mounted+=(/boot/efi)
+    else
+        echo "Nothing mounts at /boot/efi. This must be a misconfiguration" >&2
+        echo "(unless your entire root file system is on the EFI system" >&2
+        echo "partition [ESP] which would be highly unusual). The ESP" >&2
+        echo "must be mounted or the core image cannot be installed." >&2
+        exit 1
+    fi
+fi
+
+bootdev=$(awk -v bootmnt="${bootmnt}" \
+          '$2 == bootmnt && $1 ~ /^\/dev/ { print $1; exit }' \
+          /proc/self/mounts)
+if [[ -z "${bootdev}" ]]; then
+    echo "Failed to determine which device is the boot device." >&2
+    read -p "Enter the name of the boot device (e.g. /dev/sda1): "
+    bootdev=${REPLY}
+    if [[ ! -b "${bootdev}" ]]; then
+        echo "${bootdev} is not a valid block device name." >&2
+        exit 1
+    fi
+fi
+
+devtype=$(lsblk --noheadings --output TYPE "${bootdev}")
+case "${devtype}" in
+    crypt)
+        root=crypt0
+        ;;
+    lvm)
+        output=$(lvdisplay "${bootdev}")
+        vgname=$(awk '/VG Name/ { print $NF; exit }' <<< "${output}")
+        lvname=$(awk '/LV Name/ { print $NF; exit }' <<< "${output}")
+        root=lvm/${vgname}-${lvname}
+        ;;
+    part)
+        partnum=$(grep -Eo '[[:digit:]]+$' <<< "${bootdev}")
+        root=crypt0,${partnum}
+        ;;
+esac
+if [[ "${bootmnt}" == /boot ]]; then
+    prefix=(${root})/grub
+else
+    prefix=(${root})/boot/grub
+fi
+
+output=$(lsblk --inverse --list --noheadings --output NAME,TYPE --paths \
+         "${bootdev}")
+luksdev=$(awk '$2 == "crypt" { crypt = 1; next } crypt { print $1; exit }' \
+          <<< "${output}")
+if [[ -z "${luksdev}" ]] || ! cryptsetup isLuks "${luksdev}"; then
+    echo "Failed to find LUKS device containing ${bootdev}." >&2
+    exit 1
+fi
+
+output=$(cryptsetup luksDump "${luksdev}")
+uuid=$(awk '$1 == "UUID:" { print $2; exit }' <<< "${output}")
+cipher=$(awk '$1 == "Cipher:" { print $2; exit }' <<< "${output}")
+hash=$(awk '$1 == "Hash:" { print $2; exit }' <<< "${output}")
+pbkdf=$(awk '$1 == "PBKDF:" { print $2; exit }' <<< "${output}")
+
+echo "Boot mountpoint : ${bootmnt}"
+echo "Boot device     : ${bootdev}"
+echo "Boot device type: ${devtype}"
+echo "LUKS device     : ${luksdev}"
+echo "LUKS device UUID: ${uuid}"
+echo "LUKS cipher     : ${cipher}"
+echo "LUKS hash       : ${hash}"
+echo "LUKS PBKDF      : ${pbkdf}"
+echo "GRUB root       : ${root}"
+echo "GRUB prefix     : ${prefix}"
+echo ""
+read -p "Enter 'y' if the above looks correct: "
+if [[ "${REPLY}" != y ]]; then
+    exit 1
+fi
+echo ""
+
+if [[ "${pbkdf}" != pbkdf2 ]]; then
+    echo "GRUB (as of 2.06) only supports pbkdf2. GRUB will not be able to" >&2
+    echo "unlock your boot volume which is using ${pbkdf}. Please change" >&2
+    echo "the PBKDF algorithm on ${luksdev} to pbkdf2 before installing GRUB." >&2
+    exit 1
+fi
+
+# grub-install needs to be run to copy the modules and other files
+# (fonts, locales, themes, etc.) to the boot volume. It also will
+# create the required directory structure on the EFI system partition
+# and set the EFI NVRAM variables via efibootmgr. We also run it in
+# verbose mode and then glean from the log which modules it would have
+# included (which won't include any of the LUKS modules), so that we
+# know what modules in addition to the LUKS modules we should include.
+if ! log=$(mktemp grub-install.log.XXXX); then
+    exit 1
+fi
+echo -n "Running grub-install... "
+if ! grub-install --verbose &> "${log}"; then
+    echo "FAILED."
+    echo ""
+    mv "${log}" grub-install.log
+    chmod a+r grub-install.log
+    echo "grub-install failed. Check grub-install.log for reason." >&2
+    exit 1
+fi
+echo "done."
+
+mods=($(grep -o 'reading.*[.]mod' "${log}" | sort -u |
+        awk '{ gsub(/.*\/|[.]mod/, "", $2); print $2 }'))
+
+# grub-install will have failed to detect anything beyond the LUKS
+# container (so it won't detect if there's a GPT partition backing the
+# LUKS container, for example). We'll walk the "device stack" from the
+# LUKS device on down and see if any other GRUB modules will be needed
+# to handle those devices.
+devstack=($(lsblk --inverse --list --noheadings --output NAME,TYPE --paths \
+            "${luksdev}"))
+for index in "${!devstack[@]}"; do
+    if ((index % 2 == 0)); then
+        dev=${devstack[index]}
+        continue
+    else
+        type=${devstack[index]}
+    fi
+    case "${type}" in
+        disk)
+            # No GRUB module needed for disks.
+            :
+            ;;
+        lvm)
+            add_mod lvm
+            ;;
+        part)
+            parttype=$(blkid -p -s PART_ENTRY_SCHEME -o value "${dev}")
+            case "${parttype}" in
+                dos)
+                    add_mod part_msdos
+                    ;;
+                gpt)
+                    add_mod part_gpt
+                    ;;
+                *)
+                    echo "Unhandled partition type: ${parttype}" >&2
+                    exit 1
+                    ;;
+            esac
+            ;;
+        raid*)
+            output=$(mdadm --detail "${dev}")
+            if [[ "${?}" -ne 0 ]]; then
+                echo "Failed to get RAID details for ${dev}" >&2
+                exit 1
+            fi
+            raid_version=$(awk '/Version/ { print $NF; exit }' <<< "${output}")
+            raid_level=$(awk '/Raid Level/ { print $NF; exit }' <<< "${output}")
+            case "${raid_version}" in
+                1.*)
+                    add_mod mdraid1x
+                    ;;
+                0.9*)
+                    add_mod mdraid09
+                    ;;
+                *)
+                    echo "Unhandled MD-RAID version: ${raid_version}" >&2
+                    exit1
+            esac
+            # GRUB only has raid5 and raid6 modules. Presumably the
+            # other common levels (i.e. raid0 and raid1) are handled
+            # by mdraid1x/mdraid09.
+            case "${raid_level}" in
+                raid5)
+                    add_mod raid5rec
+                    ;;
+                raid6)
+                    add_mod raid6rec
+                    ;;
+            esac
+            ;;
+        *)
+            echo "Unhandled device type: ${type} (${dev})" >&2
+            exit 1
+            ;;
+    esac
+done
+
+# cryptodisk and luks2 will always be required.
+add_mod cryptodisk
+add_mod luks2
+
+# Add the required cipher module.
+case "${cipher}" in
+    aes*)       add_mod gcry_rijndael;;
+    blowfish*)  add_mod gcry_blowfish;;
+    camellia*)  add_mod gcry_camellia;;
+    cast5*)     add_mod gcry_cast5;;
+    des*|3des*) add_mod gcry_des;;
+    serpent*)   add_mod gcry_serpent;;
+    twofish*)   add_mod gcry_twofish;;
+    *)
+        # Can add additional future ciphers as support for them is
+        # added to GRUB/LUKS2.
+        echo "Unhandled cipher type: ${cipher}" >&2
+        exit 1
+        ;;
+esac
+
+# Add the required hash module.
+case "${hash}" in
+    crc*)      add_mod gcry_crc;; # really??
+    md4)       add_mod gcry_md4;;
+    md5)       add_mod gcry_md5;;
+    ripemd160) add_mod gcry_rmd160;;
+    sha1)      add_mod gcry_sha1;;
+    sha256)    add_mod gcry_sha256;;
+    sha512)    add_mod gcry_sha512;;
+    whirlpool) add_mod gcry_whirlpool;;
+    *)
+        # Can add additional future hashes as support for them is
+        # added to GRUB/LUKS2.
+        echo "Unhandled hash type: ${hash}" >&2
+        exit 1
+        ;;
+esac
+
+# Add the required PBKDF module.
+case "${pbkdf}" in
+    pbkdf2) add_mod pbkdf2;;
+    *)
+        # Can add additional future PBKDFs as support for them is
+        # added to GRUB.
+        echo "Unhandled PBKDF type: ${pbkdf}" >&2
+        exit 1
+        ;;
+esac
+
+# We can also glean from the log where grub-install wants the core
+# image to be output.
+image=$(awk '/copying.*\/boot\/grub\/x86_64-efi\/core.efi/ {
+        gsub(/[`'"'"']|[.]$/, "", $NF); print $NF; exit }' "${log}")
+
+echo "Core image is ${image}"
+
+# GRUB will load the "normal" module after executing any embedded
+# configuration, so the only thing we need to do in our embedded
+# configuration is cryptomount the LUKS device containing the boot
+# volume.
+config=$(mktemp grub.cfg.XXXX)
+echo "cryptomount -u ${uuid//-/}" > "${config}"
+
+opts+=(-c "${config}")
+opts+=(-o "${image}")
+opts+=(-O x86_64-efi)
+opts+=(-p "${prefix}")
+
+output=$(grub-mkimage "${opts[@]}" "${mods[@]}" 2>&1)
+if [[ "${?}" -ne 0 ]]; then
+    echo "grub-mkimage failed: ${output}" >&2
+    exit 1
+fi
+echo "Wrote new core image with the following modules:"
+echo "${mods[*]}"
+
+exit 0
+
+# Local Variables:
+# sh-basic-offset: 4
+# indent-tabs-mode: nil
+# End:
