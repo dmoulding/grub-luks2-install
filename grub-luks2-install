@@ -209,6 +209,11 @@ for index in "${!devstack[@]}"; do
         type=${devstack[index]}
     fi
     case "${type}" in
+        crypt)
+            # crypt modules are always added, the selection of which
+            # is handled below.
+            :
+            ;;
         disk)
             # No GRUB module needed for disks.
             :
